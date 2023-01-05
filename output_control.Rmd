@@ -1,0 +1,990 @@
+---
+title: "Control Script for SCOPE data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = TRUE)
+options(dplyr.summarise.inform=F)
+library(data.table)
+library(pbapply)
+library(RaMS)
+library(tidyverse)
+library(xcms)
+
+polarity <- "pos"
+cruise <- "mesocenter"
+output_folder <- paste0(c(cruise, polarity, "output/"), collapse = "_")
+mzml_path <- paste0("mzMLs/", polarity, "/")
+#mzml_path <- paste0("../mzMLs/", polarity, "/")
+
+source("functions.R")
+
+cruise_metadata <- read.csv("metadata_complete.csv") %>%
+  filter(cruise==!!cruise)
+
+run_date <- cruise_metadata %>%
+  filter(cruise==!!cruise) %>%
+  pull(date_run) %>%
+  unique()
+
+ms_files <- cruise_metadata$filename
+
+#BiocParallel::register(BPPARAM = BiocParallel::SnowParam(tasks = length(ms_files), progressbar = TRUE))
+```
+
+## Peakpicking
+
+**Obviously** the most important step, you can't do anything else without first finding things to look at and talk about. The script below, when sourced, runs XCMS's centWave peakpicking. It also calculates an improved signal-to-noise and metric of Gaussian-ness that seems to sift through the noise more accurately than the default signal-to-noise ratio, which has known bugs (https://doi.org/10.1021/acs.analchem.7b01069). Finally, it performs retention time correction and peak correspondence (grouping peaks across files).
+
+It takes in the metadataframe created above as well as the list of paths to the .mzML files and returns a (rather large) data frame full of peaks. 
+
+```{r peakpicking, error=TRUE}
+# Create folder if it doesn't already exist
+if(!dir.exists(output_folder)){dir.create(output_folder)}
+
+# Define the peakpicking parameters
+cwp <- CentWaveParam(ppm = 2.5, peakwidth = c(15, 15), 
+                     snthresh = 1, prefilter = c(5, 10000), 
+                     integrate = 2, mzCenterFun = "wMean", 
+                     mzdiff = 0.001, fitgauss = FALSE, 
+                     noise = 5000, firstBaselineCheck = FALSE, 
+                     extendLengthMSW = TRUE)
+
+# Set the new quality threshold
+qscore_threshold <- 20
+
+# Define the retention time correction parameters
+obp <- ObiwarpParam(binSize = 0.1, centerSample = 27, 
+                    response = 1, distFun = "cor_opt")
+
+# Define the correspondence parameters
+pdp <- PeakDensityParam(sampleGroups = cruise_metadata$depth, 
+                        bw = 12, minFraction = 0.1, 
+                        binSize = 0.001, minSamples = 2)
+
+# Make sure that filled peaks have at least a 2.5ppm window from mzmin to mzmax around mz
+fpp <- FillChromPeaksParam(ppm = 2.5)
+
+
+# Perform peakpicking
+source("scripts/peakpicking.R")
+
+# Save intermediate results
+saveRDS(xdata, file = paste0(output_folder, "xdata.rds"))
+saveRDS(xdata_cleanpeak, file = paste0(output_folder, "xdata_cleanpeak.rds"))
+saveRDS(xdata_rt, file = paste0(output_folder, "xdata_rt.rds"))
+saveRDS(xdata_cor, file = paste0(output_folder, "xdata_cor.rds"))
+saveRDS(xdata_filled, file = paste0(output_folder, "xdata_filled.rds"))
+write.csv(raw_peaks, file = paste0(output_folder, "raw_peaks.csv"), row.names = FALSE)
+unique(warnings())
+```
+
+```{r pooled_msdata}
+xdata_filled <- readRDS(file = paste0(output_folder, "xdata_filled.rds"))
+
+pooled_idx <- grep(fileNames(xdata_filled), pattern = "Poo") %>%
+  sprintf(fmt = "F%02d") %>%
+  paste0(collapse = "|")
+xdata_temp <- dropAdjustedRtime(xdata_filled)
+pooled_rtimes <- rtime(xdata_temp) %>%
+  `[`(., grepl(names(.), pattern = pooled_idx))
+corrected_rtimes <- rtime(xdata_filled) %>%
+  `[`(., grepl(names(.), pattern = pooled_idx))
+names(corrected_rtimes) <- round(pooled_rtimes, digits = 5)
+
+pooled_msdata <- grep(ms_files, pattern = "Poo", value = TRUE) %>%
+  paste0(mzml_path, .) %>%
+  grabMSdata(grab_what = c("MS1", "BPC"))
+
+pooled_msdata$MS1$rt_cor <- corrected_rtimes[as.character(round(pooled_msdata$MS1$rt*60, digits = 5))]
+
+saveRDS(pooled_msdata, file = paste0(output_folder, "pooled_msdata_", polarity, ".rds"))
+```
+
+```{r peakpickcheck}
+# Read in raw data
+xdata_filled <- readRDS(file = paste0(output_folder, "xdata_filled.rds"))
+given_stans <- read.csv("metadata/clean_stans.csv")
+pooled_msdata <- readRDS(paste0(output_folder, "pooled_msdata_", polarity, ".rds"))
+
+# Check on number of peaks picked for Alanine
+ala_mz <- given_stans %>% filter(compound_name=="L-Alanine") %>% pull(mz)
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(ala_mz, 10)) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = rtmin), color="green") +
+  geom_vline(aes(xintercept = rtmax), color="red") +
+  geom_line(aes(x=rt_cor, y=int, group=filename), 
+            data = pooled_msdata$MS1[mz%between%pmppm(ala_mz)])
+
+# Check on number of peaks picked for TMAB
+tmab_mz <- given_stans %>% filter(str_detect(compound_name, "(3-Carboxypropyl)")) %>% pull(mz)
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(tmab_mz, 10)) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = rtmin), color="green") +
+  geom_vline(aes(xintercept = rtmax), color="red") +
+  geom_line(aes(x=rt_cor, y=int, group=filename), 
+            data = pooled_msdata$MS1[mz%between%pmppm(tmab_mz)])
+
+
+
+# Check on number of peaks picked for ectoine
+ecto_mz <- given_stans %>% 
+  filter(str_detect(compound_name, "Ectoine") & polarity=="pos") %>% 
+  pull(mz)
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(ecto_mz, 10)) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = rtmin), color="green") +
+  geom_vline(aes(xintercept = rtmax), color="red") +
+  geom_line(aes(x=rt_cor, y=int, group=filename), 
+            data = pooled_msdata$MS1[mz%between%pmppm(ecto_mz)])
+
+
+
+# Number of peaks picked for noise
+noise_mz <- 123.04054
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(noise_mz, 10)) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = rtmin), color="green") +
+  geom_vline(aes(xintercept = rtmax), color="red") +
+  geom_line(aes(x=rt_cor, y=int, group=filename), 
+            data = pooled_msdata$MS1[mz%between%pmppm(noise_mz)])
+
+
+# Check on npeaks for unknown split peak
+split_mz <- 83.037114+1.007276
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(split_mz, 10)) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = rtmin), color="green") +
+  geom_vline(aes(xintercept = rtmax), color="red") +
+  geom_line(aes(x=rt_cor, y=int, group=filename), 
+            data = pooled_msdata$MS1[mz%between%pmppm(split_mz, 10)])
+```
+
+```{r rtcheck}
+# Read in raw data
+xdata_filled <- readRDS(file = paste0(output_folder, "xdata_filled.rds"))
+given_stans <- read.csv("metadata/clean_stans.csv")
+pooled_msdata <- readRDS(paste0(output_folder, "pooled_msdata_", polarity, ".rds"))
+
+# Print out rt correction diagram
+cairo_pdf(filename = paste0(output_folder, "rt_cor_plot.pdf"))
+plotAdjustedRtime(xdata_filled, col = hcl.colors(length(unique(cruise_metadata$depth)), alpha = 0.2)[
+  factor(cruise_metadata$depth)])
+legend("bottomleft", legend = unique(cruise_metadata$depth), 
+       col = hcl.colors(length(unique(cruise_metadata$depth))),
+       lty = 1, bty="n", ncol = 3)
+dev.off()
+
+internal_stans <- given_stans %>% 
+  filter(compound_type=="Internal Standard") %>%
+  filter(polarity==!!polarity)
+
+pdf(file = paste0(output_folder, "obp_alignment.pdf"), height = 5, width = 8)
+internal_stans %>%
+  slice(3) %>%
+  pull(mz, compound_name) %>%
+  iwalk(function(mz_i, name_i){
+    adenine_chr <- chromatogram(xdata_filled, mz=pmppm(mz_i, 5))
+    print(plot(adenine_chr, main=name_i))
+  })
+dev.off()
+
+groupdata <- xdata_filled %>%
+  featureDefinitions() %>%
+  as.data.frame() %>%
+  as_tibble()
+internal_stans %>%
+  pmap_dfr(function(...){
+    row_data <- tibble(...)
+    filter(groupdata, mzmed%between%pmppm(row_data$mz, 10)) %>% 
+      mutate(compound_name = row_data$compound_name)
+      #cbind(row_data$compound_name, .) # This is the original code: it adds IS name and checks that an IS       was found. The error is a handling exceptions for when nothing is there.
+  }) %>%
+  as_tibble()
+
+pooled_msdata$MS1[mz%between%pmppm(90.055504, 10)] %>%
+  mutate(rt=rt*60) %>%
+  pivot_longer(cols = c("rt", "rt_cor"), names_to = "rt_type") %>% 
+  ggplot() + 
+  geom_line(aes(x=value, y=int, group=filename, color=rt_type)) +
+  scale_color_manual(values = c("#FF000044", "#00FF0044")) +
+  facet_wrap(~rt_type, ncol = 1) +
+  xlim(500, 750)
+
+pooled_msdata$MS1[mz%between%pmppm(104.107539, 10)] %>%
+  mutate(rt=rt*60) %>%
+  pivot_longer(cols = c("rt", "rt_cor"), names_to = "rt_type") %>% 
+  ggplot() + 
+  geom_line(aes(x=value, y=int, group=filename, color=rt_type)) +
+  scale_color_manual(values = c("#FF000044", "#00FF0044")) +
+  facet_wrap(~rt_type, ncol = 1) +
+  xlim(500, 750)
+
+# This one file shows some weird RT correction
+## Corrected RT:
+pooled_msdata$MS1[mz%between%pmppm(93.07429, 10)] %>%
+  ggplot(aes(x=rt_cor, y=int, group=filename)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~filename, ncol = 3)
+## Normal RT:
+pooled_msdata$MS1[mz%between%pmppm(93.07429, 10)] %>%
+  ggplot(aes(x=rt, y=int, group=filename)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~filename, ncol = 3)
+```
+
+```{r groupcheck}
+# Read in raw data
+xdata_filled <- readRDS(file = paste0(output_folder, "xdata_filled.rds"))
+given_stans <- read.csv("metadata/clean_stans.csv")
+saveRDS(pooled_msdata, file = paste0(output_folder, "pooled_msdata_", polarity, ".rds"))
+
+pooled_file_idxs <- grep("Poo", fileNames(xdata_filled))
+xdata_pooled <- filterFile(xdata_filled, pooled_file_idxs)
+xdata_pooled_rtcor <- xdata_pooled
+new_rts <- adjustedRtime(xdata_filled)[fromFile(xdata_filled)%in%pooled_file_idxs]
+adjustedRtime(xdata_pooled_rtcor) <- split(new_rts, str_extract(names(new_rts), "F\\d+"))
+chr_sampleGroups <- str_extract(fileNames(xdata_pooled), "180821|180205|190715")
+pdp <- PeakDensityParam(sampleGroups = chr_sampleGroups, 
+                        bw = 12.5, minFraction = 0.1, 
+                        binSize = 0.001, minSamples = 2)
+
+
+
+ala_mz <- given_stans %>% filter(compound_name=="L-Alanine") %>% pull(mz)
+# 3 groups when bw < 12
+# 1 group if bw >12
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(ala_mz, 5)) %>%
+  `rownames<-`(NULL) %>% 
+  arrange(rtmed)
+par(mfrow=c(2,1))
+raw_chr <- chromatogram(xdata_pooled, mz=pmppm(ala_mz), rt=c(550, 750))
+plot(raw_chr, col=NA)
+raw_chr_cor <- chromatogram(xdata_pooled_rtcor, mz=pmppm(ala_mz), rt=c(550, 750))
+plot(raw_chr_cor, col=NA)
+
+grp_chr <- groupChromPeaks(raw_chr_cor, pdp)
+featureDefinitions(grp_chr)
+plotChromPeakDensity(grp_chr, col=hcl(c(120, 240, 360))[factor(chr_sampleGroups)])
+
+
+
+
+# Should be one group, actually 2 (with bw=10)
+# Becomes one group with bw=12
+doublegroup_mz <- 171.0844
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(doublegroup_mz, 10))
+par(mfrow=c(2,1))
+raw_chr <- chromatogram(xdata_pooled, mz=pmppm(doublegroup_mz), rt=c(100, 350))
+plot(raw_chr, col=NA)
+raw_chr_cor <- chromatogram(xdata_pooled_rtcor, mz=pmppm(doublegroup_mz), rt=c(150, 300))
+plot(raw_chr_cor, col=NA)
+
+grp_chr <- groupChromPeaks(raw_chr_cor, pdp)
+featureDefinitions(grp_chr)
+plotChromPeakDensity(grp_chr, col=hcl(c(120, 240, 360))[factor(chr_sampleGroups)])
+
+
+
+doublegroup_mz <- 146.1181
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(doublegroup_mz, 10))
+par(mfrow=c(2,1))
+raw_chr <- chromatogram(xdata_pooled, mz=pmppm(doublegroup_mz), rt=c(200, 700))
+plot(raw_chr, col=NA)
+raw_chr_cor <- chromatogram(xdata_pooled_rtcor, mz=pmppm(doublegroup_mz), rt=c(200, 700))
+plot(raw_chr_cor, col=NA)
+
+grp_chr <- groupChromPeaks(raw_chr_cor, pdp)
+featureDefinitions(grp_chr)
+plotChromPeakDensity(grp_chr, col=hcl(c(120, 240, 360))[factor(chr_sampleGroups)])
+
+
+
+# Separates Adenine 15N2 into two peaks if bw==12, groups together if 13
+doublegroup_mz <- 138.05583
+featureDefinitions(xdata_filled) %>%
+  as.data.frame() %>%
+  filter(mzmed%between%pmppm(doublegroup_mz, 10))
+par(mfrow=c(2,1))
+raw_chr <- chromatogram(xdata_pooled, mz=pmppm(doublegroup_mz), rt=c(200, 700))
+plot(raw_chr, col=NA)
+raw_chr_cor <- chromatogram(xdata_pooled_rtcor, mz=pmppm(doublegroup_mz), rt=c(200, 700))
+plot(raw_chr_cor, col=NA)
+
+grp_chr <- groupChromPeaks(raw_chr_cor, pdp)
+featureDefinitions(grp_chr)
+plotChromPeakDensity(grp_chr, col=hcl(c(120, 240, 360))[factor(chr_sampleGroups)])
+
+```
+
+
+## De-isotoping and de-adducting
+
+After peaks have been identified, many of them will be isotopes and adducts of other peaks. Removing these is important to minimize pseudoreplication issues and data artifacts. I didn't like any of the packages I tried to do this, so I wrote my own code to process this more robustly.
+
+This script does two things. First, it identifies peaks that are likely isotopes or adducts of other peaks in the data set. It does this by assuming that every single peak is an isotope/adduct of another peak. If a peak is an adduct/isotope, there will be another peak that looks very similar but is separated by a very specific mass difference. For example, if we find a peak at 140.06875, we "guess" that it's an adduct or isotope and check all the places where the M+H would be found, depending on the isotope or adduct. If we suspect it of being a 13C isotope of another peak, we'd look for a peak at 140.06875-1.003355. If we suspect it of being a sodium isotope, we'd look for a peak at 140.06875-22.99787+1.007276. In this case, we would indeed find a signal at the M+H peak if we assume sodium, but no peak at the M+H if we assume a 13C isotope - allowing us to conclude tentatively that this is actually an adduct.
+
+However, simply finding data at the expected mass isn't specific enough because we'll often stumble upon noise or a different peak in the general area. Thus, we check for peak similarity before assuming that there's real signal there. The general theory is that isotopes and adducts will be similar to the base peak in two ways. First, the individual x/y (rt/intensity) data points should match up almost exactly, as adducts and isotopes elute at the same time as the base peak. We can check this with a Pearson correlation - simply, how nicely do the two peaks correlate with each other? This method is quite sensitive to even small differences in retention time. Second, we can compare peak ratios across files. Here, we run a similar correlation but check x/y as base peak/isotope peak. This works because a compound will always create similarly stable adducts (some will love M+H, others M+Na) and will always have a fixed isotope abundance. Across multiple files, then, the correlation between these should be very strong (and is, in fact, usually stronger than the first method).
+
+```{r deisoadduct, error=TRUE}
+xdata_filled <- readRDS(file = paste0(output_folder, "xdata_filled.rds"))
+raw_peaks <- read.csv(file = paste0(output_folder, "raw_peaks.csv"))
+
+not_addisos <- list("Glutamine"=c(mz=147.076968, rt=620),
+                    "Citrulline"=c(mz=176.103517, rt=645),
+                    "Guanine"=c(mz=152.0567, rt=400),
+                    "Glutamic acid"=c(mz=148.061, rt=745),
+                    "4-Aminobutyric acid"=c(mz=104.071, rt=614))
+# How many seconds away from the given RT can the peak be before it's removable?
+# Set high to collect entire EIC
+peak_rt_flex <- 500
+
+
+
+# When removing peaks that are likely adducts...
+# How similar do the median peak and median adduct need to be to assume adduct?
+shape_remove_threshold <- 0.8
+# How good does the peak area ~ adduct area correlation across files need to be to assume adduct?
+area_remove_threshold <- 0.99
+
+# When finding adducts and isotopes of a given peak...
+# How similar do the median peak and median adduct need to be to assume adduct?
+# Typically lower than above because priors are better
+shape_find_threshold <- 0.75
+# How good does the peak area ~ adduct area correlation across files need to be to assume adduct?
+area_find_threshold <- 0.9
+
+source("scripts/deisoadduct.R")
+
+# Save intermediate files
+saveRDS(is_peak_iso, file = paste0(output_folder, "is_peak_iso.rds"))
+saveRDS(peak_envelopes, file = paste0(output_folder, "peak_envelopes.rds"))
+
+
+# Write out data frame containing features that are likely adducts and isotopes
+write.csv(addiso_features, file = paste0(output_folder, "addiso_features.csv"), row.names = FALSE)
+
+# Write out data frame containing decomposed isotope/adduct envelopes for non-adduct/iso features
+# Average MS1 peak areas for each feature and its isotopes if they pass the above thresholds
+write.csv(feature_envelopes, file = paste0(output_folder, "feature_envelopes.csv"), row.names = FALSE)
+
+# Write out raw_peaks but it's been filled in and M_area has been calculated for every single peak
+# Includes ALL peaks, both addiso and not
+write.csv(filled_peaks, file = paste0(output_folder, "filled_peaks.csv"), row.names = FALSE)
+
+unique(warnings())
+```
+
+```{r isoaddcheck}
+saveRDS(pooled_msdata, file = paste0(output_folder, "pooled_msdata_", polarity, ".rds"))
+raw_peaks <- read.csv(paste0(output_folder, "raw_peaks.csv"))
+addiso_features <- read.csv(paste0(output_folder, "addiso_features.csv"))
+addiso_envelopes <- read.csv(paste0(output_folder, "addiso_envelopes.csv"))
+iso_masses <- c(C13=1.003355, X2C13=2*1.003355, S34=1.995796, S33=0.999387, N15=0.997035, O18=2.004244)
+adduct_masses <- c(Na=22.98922-1.007276, NH4=18.0338-1.007276, H2O_H=-18.0106, K=38.963708-1.007276)
+addiso_masses <- c(adduct_masses, iso_masses)
+
+# Convert to feature-based format
+addiso_data <- raw_peaks %>% 
+  group_by(feature) %>%
+  summarize(mzmed=median(mz), rtmed=median(rt)) %>%
+  inner_join(addiso_envelopes, by="feature") %>%
+  pivot_longer(cols = C13:X2H, names_to = "addiso", values_to = "addiso_area") %>%
+  filter(addiso_area>0)
+
+# How many adducts/isos of each type were found?
+addiso_data %>%
+  group_by(addiso) %>%
+  count(addiso) %>%
+  arrange(desc(n))
+
+# Check on some random adduct-iso pairings
+addiso_data %>%
+  filter(addiso%in%names(addiso_masses)) %>%
+  mutate(addiso_mass=mzmed+addiso_masses[addiso]) %>%
+  select(feature, mzmed, rtmed, addiso, addiso_mass) %>%
+  # sample_n(1) %>%
+  # sample_n(1) %>%
+  filter(feature=="FT0924") %>% 
+  pwalk(function(...){
+    row_data <- tibble(...)
+    orig_EIC <- pooled_msdata$MS1[mz%between%pmppm(row_data$mzmed, 5) &
+                                    rt_cor%between%(row_data$rtmed+c(-60, 60))]
+    addiso_EIC <- pooled_msdata$MS1[mz%between%pmppm(row_data$addiso_mass, 5) &
+                                      rt_cor%between%(row_data$rtmed+c(-60, 60))]
+    all_data <- rbind(cbind(orig_EIC, type=paste0("M (", row_data$feature, ")")), 
+                      cbind(addiso_EIC, type = paste0("M_addiso (", row_data$addiso, ")")))
+    gp <- ggplot(all_data) +
+      geom_line(aes(x=rt_cor, y=int, group=filename, color=str_extract(filename, "180821|180205|190715"))) +
+      facet_wrap(~type, ncol = 1, scales="free_y") +
+      geom_vline(xintercept = row_data$rtmed, col="green") +
+      theme(legend.position = c(0.8, 0.8)) +
+      labs(color="Cruise")
+    print(gp)
+  })
+
+
+v <- raw_peaks %>% group_by(feature) %>% count()
+w <- rbind(addiso_peaks[,c("feature", "mz", "rt")], 
+           real_peaks[,c("feature", "mz", "rt")]) %>%
+  group_by(feature) %>% count()
+
+left_join(v, w, by="feature") %>%
+  filter(n.x!=n.y)
+
+addiso_peaks %>% 
+  filter(feature=="FT0227") %>%
+  filter(duplicated(filename))
+
+raw_peaks %>%
+  group_by(feature) %>%
+  filter(duplicated(filename)) %>%
+  select(feature, filename) %>%
+  left_join(raw_peaks, by=c("feature", "filename")) %>%
+  select(feature, filename, mz) %>%
+  as.data.frame() %>%
+  slice(1:20)
+
+#grabMSdata(files = "../mzMLs/pos/180821_Smp_MS7C115m_B.mzML", grab_what = 
+grabMSdata(files = "mzMLs/pos/180821_Smp_MS7C115m_B.mzML", grab_what =
+"MS1")$MS1[mz%between%pmppm(63.02701423)] %>%
+  ggplot(aes(x=rt, y=int)) + geom_point() + geom_line() + 
+  facet_wrap(~filename, ncol = 1) + xlim(c(9.5, 10.5))
+```
+
+
+
+## Annotate standards
+
+```{r targeted}
+filled_peaks <- read.csv(paste0(output_folder, "filled_peaks.csv"))
+given_stans <- read.csv("metadata/clean_stans.csv") %>% 
+  filter(polarity==!!polarity) %>%
+  filter(run_date>=date_added)
+
+feature_data <- filled_peaks %>%
+  group_by(feature) %>%
+  summarise(mzmed=median(mz), rtmed=median(rt), avgarea=mean(M_area))
+
+source("scripts/standard_assignments.R")
+
+write.csv(stan_annotations, paste0(output_folder, "stan_annotations.csv"), 
+          row.names = FALSE)
+```
+
+```{r check_targeted_if_falkor}
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv")) %>%
+  select(compound_name, feature)
+
+filled_peaks <- read.csv(paste0(output_folder, "filled_peaks.csv")) %>%
+  select(feature, filename, M_area)
+
+clean_stans <- read.csv("metadata/clean_stans.csv")
+
+
+if(cruise=="falkor" & polarity=="pos"){
+  falkor_manual <- read.csv("Falkor_Ingalls_Lab_QE_Transition Results_POS.csv") %>%
+  select(compound_name_old="Precursor.Ion.Name", filename=Replicate.Name, 
+         raafay_area=Area) %>%
+  mutate(filename=paste0(filename, ".mzML")) %>%
+  left_join(clean_stans, by="compound_name_old") %>%
+  select(compound_name, filename, raafay_area) %>% 
+  mutate(raafay_area=as.numeric(raafay_area))
+
+  peak_matchup <- falkor_manual %>%
+    left_join(stan_annotations, by="compound_name") %>% 
+    left_join(raw_peaks, by=c("feature", "filename"))
+  cor_order <- peak_matchup %>%
+    group_by(compound_name) %>%
+    summarise(sim_cor=cor(raafay_area, M_area, use = "pairwise")) %>%
+    arrange(desc(sim_cor))
+  peak_matchup$compound_name <- factor(peak_matchup$compound_name, 
+                                       levels = cor_order$compound_name)
+  
+  gp <- ggplot(peak_matchup) +
+    geom_point(aes(x=raafay_area, y=M_area)) +
+    facet_wrap(~compound_name, scales = "free") +
+    geom_abline(slope = 1, intercept = 0)
+  ggsave(gp, filename = paste0(output_folder, "targeted_comp.png"),
+         device = "png", width = 20, height = 20)
+}
+```
+
+
+
+## Finding B-MISs
+
+```{r B-MIS}
+filled_peaks <- read.csv(paste0(output_folder, "filled_peaks.csv"))
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv"))
+given_stans <- read.csv("metadata/clean_stans.csv") %>% 
+  filter(polarity==!!polarity)
+
+min_improvement <- 0.4
+already_good <- 0.1 #Not currently used
+
+source("scripts/bmisscript.R")
+
+write.csv(IS_peaks, file = paste0(output_folder, "IS_peaks.csv"), 
+          row.names = FALSE)
+write.csv(chosen_BMIS, file = paste0(output_folder, "chosen_BMIS.csv"), 
+          row.names = FALSE)
+```
+
+```{r bmischeck}
+IS_peaks <- read.csv(paste0(output_folder, "IS_peaks.csv"))
+
+# Create plot of absolute IS areas
+facet_labels <- paste(unique(IS_peaks$stan), unique(IS_peaks$feature), sep=": ")
+names(facet_labels) <- unique(IS_peaks$feature)
+IS_areas_gp <- IS_peaks %>%
+  mutate(type=str_extract(filename, "Blk|Poo|Smp|Std")) %>%
+  mutate(xax=str_extract(filename, "(?<=_.{3}_).*(?=\\.mzML)")) %>%
+  # mutate(xax=paste0(str_extract(filename, "^\\d+"), "_", xax)) %>%
+  mutate(xax=factor(xax, levels = unique(xax))) %>%
+  ggplot() +
+  geom_bar(aes(x=xax, y=M_area, fill=type), stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5)) +
+  facet_wrap(~feature, ncol = 1, scales = "free_y",
+             labeller = as_labeller(facet_labels))
+
+ggsave(plot = IS_areas_gp, filename = paste0(output_folder, "IS_areas.pdf"), 
+       device = "pdf", width = 20, height = 20, dpi = 72)
+
+
+# Create BMIS plot for IS with pooled samps vs all samps
+IS_pooled_cvs <- IS_peaks %>% 
+  filter(str_detect(filename, "_Poo_")) %>%
+  select(stan, M_area, filename) %>%
+  {full_join(., ., by=c("filename"))} %>%
+  group_by(stan.x, stan.y) %>%
+  mutate(M_area_normed=(M_area.x/M_area.y)*mean(M_area.y)) %>%
+  summarise(calc_cv=cv(M_area_normed)) %>%
+  mutate(type="pooled_only")
+IS_all_cvs <- IS_peaks %>% 
+  select(stan, M_area, filename) %>%
+  {full_join(., ., by=c("filename"))} %>%
+  group_by(stan.x, stan.y) %>%
+  mutate(M_area_normed=(M_area.x/M_area.y)*mean(M_area.y)) %>%
+  summarise(calc_cv=cv(M_area_normed)) %>%
+  mutate(type="all_files")
+BMIS_on_IS_gp <- rbind(IS_pooled_cvs, IS_all_cvs) %>%
+  pivot_wider(values_from = calc_cv, names_from = "type") %>%
+  ggplot() +
+  geom_point(aes(x=pooled_only, y=all_files, label=stan.y)) +
+  facet_wrap(~stan.x, scales = "free")
+ggsave(plot=BMIS_on_IS_gp, filename = paste0(output_folder, "BMIS_on_IS.pdf"), 
+       device = "pdf", width = 8.5, height = 8.5)
+
+if(cruise=="falkor"){
+  # Check integrations against Laura's manual efforts
+  laura_data <- read.csv("IS_HILIC-POS_Falkor.csv") %>%
+    select(stan="Precursor.Ion.Name", filename=Replicate.Name, 
+           laura_area=Area) %>%
+    mutate(filename=paste0(filename, ".mzML")) %>%
+    left_join(given_stans, by=c(stan="compound_name_old")) %>%
+    select(stan=compound_name, filename, laura_area)
+  left_join(IS_peaks, laura_data) %>%
+    ggplot() +
+    geom_point(aes(x=M_area, y=laura_area)) +
+    facet_wrap(~stan, scales = "free") +
+    geom_abline(slope = 1, intercept = 0)
+  ggsave(filename = paste0(output_folder, "laura_xcms_area_comp.png"),
+         device = "png", width = 12, height = 10)
+}
+
+# library(plotly)
+# ggplotly(IS_areas_gp)
+# ggplotly(BMIS_on_IS_gp)
+```
+
+
+
+## Annotate formulae
+
+```{r assignformulae}
+feature_envelopes <- read.csv(paste0(output_folder, "feature_envelopes.csv"))
+feature_data <- read.csv(paste0(output_folder, "filled_peaks.csv")) %>%
+  group_by(feature) %>%
+  summarise(mzmed=median(mz), rtmed=median(rt), avg_area=mean(M_area)) %>%
+  left_join(feature_envelopes, by="feature")
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv"))
+database_formulae <- readRDS("unique_formulae.rds") %>%
+  gsub(pattern = "\\+.?", replacement = "")
+
+source("scripts/formula_assignments.R")
+
+saveRDS(sirius_formulas, file = paste0(output_folder, "sirius_formulas.rds"))
+saveRDS(rdisop_formulas, file = paste0(output_folder, "rdisop_formulas.rds"))
+saveRDS(iso_formulas, file = paste0(output_folder, "iso_formulas.rds"))
+write.csv(feature_formulas, file = paste0(output_folder, "feature_formulas.csv"), row.names = FALSE)
+```
+
+```{r assessformulas}
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv"))
+stan_annotations %>%
+  filter(duplicated(feature) | duplicated(feature, fromLast = TRUE)) %>%
+  filter(!is.na(feature)) %>%
+  arrange(feature)
+
+feature_formulas <- read.csv(paste0(output_folder, "feature_formulas.csv"))
+given_stans <- read.csv("metadata/clean_stans.csv") %>% 
+  filter(polarity==!!polarity)
+
+anno_compare <- stan_annotations %>%
+  select(compound_name, feature) %>%
+  separate_rows(feature, sep = "; ") %>%
+  left_join(feature_formulas, by="feature") %>%
+  left_join(given_stans %>% 
+              filter(compound_type!="Internal Standard") %>%
+              select(compound_name, official_formula=formula),
+            by="compound_name") %>%
+  distinct(compound_name, formula, official_formula)
+
+anno_incorrect <- anno_compare %>%
+  filter(formula!=official_formula|is.na(formula)) %>%
+  mutate(elems=formula2elements(formula)) %>%
+  mutate(elems_official=formula2elements(official_formula)) %>%
+  mutate(elems=sapply(elems, function(x){
+    if(polarity=="pos"){
+      x["H"] <- x["H"]-1; x
+    } else if(polarity=="neg"){
+      x["H"] <- x["H"]+1; x
+    }
+    })) %>%
+  mutate(elem_match=mapply(function(x, y){
+    if(length(x)!=length(y))return(FALSE)
+    if(all(x==y))return(TRUE)
+    return(FALSE)
+  }, elems, elems_official)) %>%
+  filter(!elem_match) %>%
+  select(compound_name, formula, official_formula)
+
+cat(paste0("Correct annotations: ", sum(!anno_compare$compound_name%in%anno_incorrect$compound_name),
+           "\nIncorrect annotations: ", sum(!is.na(anno_incorrect$formula)),
+           "\nUnannotated: ", sum(is.na(anno_incorrect$formula))))
+```
+
+
+
+## Annotate classes and structures
+
+```{r assignids}
+raw_peaks <- read.csv(paste0(output_folder, "raw_peaks.csv"))
+addiso_envelopes <- read.csv(paste0(output_folder, "addiso_envelopes.csv"))
+feature_data <- raw_peaks %>%
+  group_by(feature) %>%
+  summarise(mzmed=median(mz), rtmed=median(rt), avg_area=mean(M_area)) %>%
+  left_join(addiso_envelopes, by = "feature")
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv"))
+
+MSMS_files <- paste0(mzml_path, "MSMS/") %>%
+  list.files(pattern = ".mzML", full.names = TRUE) %>%
+  normalizePath() %>%
+  `[`(grepl("pos", x = .))
+register(BPPARAM = SnowParam(tasks = length(MSMS_files), progressbar = TRUE))
+
+sirius_project_dir <- paste0(output_folder, "/sirius_project")
+
+source("scripts/run_sirius.R")
+
+write.csv(classy_confs, file = paste0(output_folder, "classy_confs.csv"), row.names = FALSE)
+write.csv(structure_ids, file = paste0(output_folder, "structure_ids.csv"), row.names = FALSE)
+```
+
+```{r assessclasses}
+stan_classes <- read.csv(paste0("https://raw.githubusercontent.com/",
+                             "IngallsLabUW/Ingalls_Standards/",
+                             "b098927ea0089b6e7a31e1758e7c7eaad5408535/",
+                             "Ingalls_Lab_Standards_NEW.csv")) %>%
+  filter(Column=="HILIC") %>%
+  mutate(polarity=tolower(gsub(pattern = "HILIC", "", .$Fraction1))) %>%
+  mutate(m.z=as.numeric(m.z)) %>%
+  select(compound_name=Compound.Name, classyfire=Classyfire)
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv")) %>%
+  select(compound_name, feature) %>%
+  separate_rows(feature, sep = "; ")
+classy_confs <- read.csv(file = paste0(output_folder, "classy_confs.csv"))
+
+stan_classes %>%
+  left_join(stan_annotations, by="compound_name") %>%
+  filter(!is.na(feature)) %>%
+  separate_rows(classyfire, sep = "; ") %>%
+  mutate(classyfire=str_replace(classyfire, "^.*: ", "")) %>%
+  mutate(classyfire=str_replace_all(classyfire, "_", " ")) %>%
+  distinct() %>%
+  left_join(classy_confs, by=c(classyfire="classes", "feature")) %>%
+  print(n=100)
+```
+
+```{r assessstructures}
+structure_ids <- read.csv(paste0(output_folder, "structure_ids.csv"))
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv")) %>%
+  select(compound_name, feature) %>%
+  separate_rows(feature, sep = "; ") %>%
+  left_join(structure_ids, by="feature") %>%
+  # filter(compound_name=="Glycerophosphocholine") %>%
+  print(n=200)
+
+```
+
+## Collect into the clean database
+
+After running all the code above, we've got a bunch of separate data frames that
+are a pain to work with when all we really need is two - one to hold the values
+corresponding to each *peak* and one to hold the values corresponding to each
+*feature*.
+
+Peak values: mz, rt, area, norm_area, filename
+
+Feature values: mzmed, rtmed, avgarea, formula, classes, structure/id
+
+These data frames, combined with metadata_complete, can then be left joined
+together and filtered/selected based on what information is actually needed.
+This makes the stats scripts a lot cleaner and avoids needing to recalculate
+medmz, medrt, etc. every single time.
+
+We begin with peakvals, which starts out as the xcms output raw_peaks.
+Step 1: remove adducts/isotopes named in addiso_features
+Step 2: calculate norm_area using the chosen_BMIS and IS_peaks
+
+```{r peakvals}
+# Step 0: load relevant data
+filled_peaks <- read.csv(paste0(output_folder, "filled_peaks.csv")) %>%
+  select(feature, mz, rt, M_area, filename)
+addiso_features <- read.csv(paste0(output_folder, "addiso_features.csv"))
+chosen_BMIS <- read.csv(paste0(output_folder, "chosen_BMIS.csv"))
+IS_peaks <- read.csv(paste0(output_folder, "IS_peaks.csv")) %>%
+  select(compound_name, filename, is_area=M_area)
+
+# Step 1
+filled_peaks <- filled_peaks %>%
+  filter(!feature%in%addiso_features$feature)
+
+# Step 2
+norm_peaks <- filled_peaks %>%
+  left_join(chosen_BMIS, by="feature") %>%
+  left_join(IS_peaks, by = c(BMIS="compound_name", "filename")) %>%
+  group_by(feature) %>%
+  mutate(norm_area=(M_area/is_area)*mean(is_area, na.rm=TRUE)) %>%
+  select(feature, mz, rt, norm_area, filename)
+
+write.csv(norm_peaks, paste0(output_folder, "norm_peaks.csv"), row.names = FALSE)
+```
+
+Featurevals then builds on this new norm_peaks data frame.
+Step 1: Group by feature and produce summary statistics
+ - mzmed, rtmed, avgarea
+Step 2: Annotate known standards with stan_annotations
+Step 3: Annotate formulae with feature_formulas
+Step 4: Annotate classes with classy_confs (currently removed because annoying)
+Step 5: Annotate hypothetical structures with structure_ids
+
+```{r featurevals}
+# Step 0: Load everything
+stan_annotations <- read.csv(paste0(output_folder, "stan_annotations.csv")) %>%
+  select(compound_name, feature)
+feature_formulas <- read.csv(paste0(output_folder, "feature_formulas.csv"))
+classy_confs <- read.csv(paste0(output_folder, "classy_confs.csv"))
+structure_ids <- read.csv(paste0(output_folder, "structure_ids.csv"))
+
+# Step 1: group and summarize
+norm_feats <- norm_peaks %>%
+  filter(str_detect(filename, "_Smp_")) %>%
+  group_by(feature) %>%
+  summarize(mzmed=mean(mz, na.rm=TRUE), rtmed=mean(rt, na.rm=TRUE), avgarea=mean(norm_area, na.rm=TRUE))
+
+# Step 2: authentic standards
+norm_feats <- norm_feats %>%
+  left_join(stan_annotations, by="feature")
+
+# Step 3: formulae
+norm_feats <- norm_feats %>%
+  left_join(feature_formulas, by="feature")
+
+# Step 4: classes
+# 0.99 cutoff is arbitrary
+if(file.exists(paste0(output_folder, "classy_confs.csv"))){
+  classy_confs <- read.csv(paste0(output_folder, "classy_confs.csv"))
+  clean_classes <- classy_confs %>%
+    filter(conf>0.99) %>%
+    group_by(feature) %>%
+    summarize(classes=paste(classes, collapse = "; "))
+# # Currently commented out because it's messy and super long and printing sucks
+# norm_feats <- norm_feats %>%
+#   left_join(clean_classes, by="feature")
+  # Instead they're all being set to NA
+  norm_feats$classes <- NA
+} else {
+  norm_feats$classes <- NA
+}
+
+# Step 5: structures
+# -20 cutoff is due to Raafay's manual checks, -25 ~= 80% correct
+if(file.exists(paste0(output_folder, "structure_ids.csv"))){
+  classy_confs <- read.csv(paste0(output_folder, "structure_ids.csv"))
+  clean_CSI <- structure_ids %>%
+    filter(confidence>-25) %>%
+    select(feature, CSI_name=name)
+  norm_feats <- left_join(norm_feats, clean_CSI, by="feature")
+} else {
+  norm_feats$CSI_name <- NA
+}
+
+write.csv(norm_feats, paste0(output_folder, "norm_feats.csv"), row.names = FALSE)
+```
+
+
+
+## Cruise correspondence
+
+Finally, it's useful to combine all of the output into a single data frame
+rather than working with several little ones. The real challenge here is
+asserting that a feature is the same across the different runs given differences
+in retention time, m/z, and polarity. But mostly retention time.
+
+This can only be done on output folders that have been produced by the script
+above, so if you haven't run those yet then please make sure you do.
+
+```{r checkforfolders}
+all_cruises <- c("falkor", "mesotransect", "mesocenter")
+polarities <- rep(c("pos"), each=length(all_cruises))
+output_all <- paste(paste(all_cruises, polarities, sep="_"), "output/", sep = "_")
+
+peaks_all_files <- paste0(output_all, "norm_peaks.csv")
+feats_all_files <- paste0(output_all, "norm_feats.csv")
+
+if(!all(file.exists(feats_all_files))){
+  stop(paste("Not all feats found:", output_all[!file.exists(feats_all_files)], "missing"))
+}
+if(!all(file.exists(peaks_all_files))){
+  stop(paste("Not all peaks found:", output_all[!file.exists(peaks_all_files)], "missing"))
+}
+```
+
+```{r correspond}
+feats_all <- lapply(feats_all_files, function(x){
+  given_cruise <- switch(str_extract(x, "falkor|mesotransect|mesocenter"), 
+                         "falkor"="FK", "mesotransect"="MT", "mesocenter"="MC")
+  v <- read.csv(x)
+  v$cruise <- given_cruise
+  v$feature <- str_replace(v$feature, "FT", v$cruise)
+  v
+}) %>% rbindlist() %>%
+  arrange(desc(avgarea))
+
+temp_feats <- feats_all
+output_groups <- list()
+pb <- txtProgressBar(min = 0, max = nrow(temp_feats), style = 3)
+while(nrow(temp_feats>1)){
+  print(nrow(temp_feats))
+  row_data <- temp_feats[1,]
+  # if(row_data$feature=="MC0271")stop()
+  out_group <- temp_feats %>%
+    filter(cruise!=row_data$cruise) %>%
+    filter(mzmed%between%pmppm(row_data$mzmed, 5)) %>%
+    mutate(rtmed=ifelse(cruise=="FK", rtmed+50, rtmed)) %>%
+    mutate(dist_from_main=map2_dbl(rtmed, avgarea, function(rtmed, avgarea){
+      rt_dist <- abs(log2(row_data$rtmed)-log2(rtmed))
+      area_dist <- abs(log10(row_data$avgarea)-log10(avgarea))
+      sum(rt_dist, area_dist)
+    })) %>%
+    arrange(dist_from_main)
+  if(nrow(out_group>0)){
+    out_group <- out_group %>%
+      filter(rtmed%between%(row_data$rtmed+c(-60, 60))) %>%
+      group_by(cruise) %>%
+      slice(1) %>%
+      select(-dist_from_main) %>%
+      ungroup() %>%
+      add_row(row_data)
+  } else {
+    out_group <- row_data
+  }
+  temp_feats <- temp_feats[!temp_feats$feature%in%out_group$feature,]
+  output_groups[[length(output_groups)+1]] <- out_group
+  setTxtProgressBar(pb, nrow(feats_all)-nrow(temp_feats))
+}
+close(pb)
+
+feat_groups <- output_groups %>%
+  map2_dfr(seq_along(.), function(group, id){
+    cbind(group, group_feat=sprintf("FT%04d", id))
+  })
+
+write.csv(feat_groups, "complete_untarg_list.csv", row.names = FALSE)
+```
+
+```{r cross-cruise pooled_data RaMS check}
+metadata_complete <- read.csv("metadata/metadata_complete.csv")
+pooled_metadata <- metadata_complete %>%
+  filter(str_detect(filename, "_Poo_.*Full"))
+
+pooled_msdata <- grabMSdata(paste0(mzml_path, pooled_metadata$filename))
+
+mz_i <- 62.06076
+rt_i <- c(0, 25)
+# rt_i <- c(10, 12)
+falkor_idxs <- str_detect(pooled_msdata$MS1$filename, "190715")
+pooled_msdata$MS1$rt[falkor_idxs] <- pooled_msdata$MS1$rt[falkor_idxs]+50/60
+pooled_msdata$MS1[mz%between%pmppm(mz_i, 5) & rt%between%rt_i] %>%
+  left_join(pooled_metadata) %>%
+  ggplot() + geom_line(aes(x=rt, y=int, group=filename, color=cruise)) +
+  facet_wrap(~cruise, ncol = 1)
+```
+
+```{r cross-cruise stan_data RaMS check}
+stan_metadata <- metadata_complete %>%
+  filter(str_detect(filename, "_Std_.*H2O")) %>%
+  filter(str_detect(filename, "Matrix", negate = TRUE))
+
+stan_msdata <- grabMSdata(paste0(mzml_path, stan_metadata$filename))
+
+stan_msdata$MS1[mz%between%pmppm(mz_i, 5) & rt%between%rt_i] %>%
+  left_join(stan_metadata) %>%
+  ggplot() + geom_line(aes(x=rt, y=int, group=filename, color=cruise)) +
+  facet_wrap(~cruise, ncol = 1)
+```
+
+```{r eval=FALSE}
+msms_files <- list.files(paste0(mzml_path, "MSMS/"), full.names = TRUE, pattern = "190.*mzML|1802.*mzML")
+
+msmsdata <- grabMSdata(msms_files)
+
+msmsdata$MS1[mz%between%pmppm(162.1125, 5)] %>%
+  mutate(cruise=str_extract(filename, "180205|180821|190715")) %>%
+  ggplot() + geom_line(aes(x=rt, y=int, group=filename, color=cruise)) +
+  geom_vline(xintercept = c(6, 7.8))
+
+msmsdata$MS2[premz%between%pmppm(162.1125, 10)] %>%
+  filter(str_detect(filename, "190715")) %>%
+  # filter(rt%between%c(6, 7.8)) %>%
+  filter(rt%between%c(7.8, 9.5)) %>%
+  arrange(desc(int)) %>%
+  print(20)
+
+msmsdata$MS2[fragmz%between%pmppm(103.039519, 5)] %>%
+  filter(int>10000) %>%
+  ggplot() + geom_point(aes(x=rt, y=premz, color=log10(int)))
+```
+
+

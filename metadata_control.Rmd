@@ -1,0 +1,802 @@
+---
+title: "Metadata Control Doc"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cmap4r)
+
+toDecDeg <- function(Latitude, X7){
+  v <- strsplit(Latitude, " ")
+  num <- as.numeric(v[[1]][1])+as.numeric(v[[1]][length(v[[1]])])/60
+  if(X7%in%c("S", "W")){
+    num*-1
+  } else {
+    num
+  }
+}
+
+cmap_api <- "6acd63a0-4c63-11ea-aa09-71d9d763e28d"
+set_authorization(cmap_key = cmap_api)
+
+scope_uname <- "scope"
+scope_pw <- "SCOPE2014"
+
+ms_files <- "../mzMLs" %>%
+  list.files(pattern = "mzML", full.names = TRUE, recursive = TRUE) %>%
+  str_subset("MSMS", negate = TRUE) %>%
+  basename() %>%
+  unique()
+```
+
+# File metadata ----
+
+Metadata for each cruise consists of the following:
+  - filename: The actual name of the file, as detected in the mzMLs folder
+  - station: The cruise spot where the data was collected, deduced from filename
+  - tripl: The bottle triplicate (A, B, or C), deduced from filename
+  - cast: Which CTD cast collected the sample? Assumed 1 if not in filename
+  - depth: What depth the sample was collected at. Deduced from filename
+  - spindir: The eddy polarity (cyclonic/anticyclonic) for the station.
+    - Manually entered based on prior knowledge of SLA during the sample site
+    - Falkor: Stations 62 and 64 were cyclonic
+    - Mesotransect: Stations 4, 11, 12, and 13 were cyclonic
+    - Mesocenter: Station L1 was cyclonic
+  - date_run: The time the sample was run on the instrument, deduced from filename
+  - time: Deduced from SCOPE bottle data as matched to station number
+  - lat/lon: Deduced from SCOPE bottle data as matched to station number
+  - abs_depth: Absolute depth, in meters.
+    - Manually collected from cruise binder pdfs and matched to station number
+  - sla: Downloaded from CMAP using lat/lon/date info
+
+"Extra" files, i.e. pooled samples, blanks, and standards all have Poo/Blk/Std
+in the metadata columns except for time, lat, and lon which are NA.
+
+Raw data comes from several sources. Several parameters can be deduced from
+the file name itself, which is often coded as 
+daterun_type_cruisestationcast-depth_triplicate. Other data can be collected from
+the SCOPE website itself where the CTD data is stored (lat, lon, time), and
+CMAP, which collects SLA data and other things. DCM depth was manually
+collected from the cruise binders. All raw data should be found in the metadata/
+folder, but can be recreated using the chunk below if connected to the internet.
+
+```{r raw_data_collection}
+# DCMs are entered manually
+if(!file.exists("metadata/all_DCMs.csv")){
+  falkor_DCMs <- data.frame(
+    station=c(62, 64, 77, 80),
+    cast=1,
+    DCM_depth=c(98, 115, 125, 120)
+  )
+  transect_DCMs <- data.frame(
+    station = paste0("MS", c(4:13, 13, 14)),
+    cast=c(1,1,3,1,1,2,2,2,1,2,3,2),
+    DCM_depth=c(100, 122, 119, 133, 122, 110, 110, 110, 103, 112, 112, 105)
+  )
+  center_DCMs <- data.frame(
+    station = paste0("L", c(1,1,2,2)),
+    cast=c(32, 33, 1, 2),
+    DCM_depth=c(108, 104, 123, 123)
+  )
+  all_DCMs <- rbind(falkor_DCMs, transect_DCMs, center_DCMs)
+
+  write.csv(all_DCMs, "metadata/all_DCMs.csv", row.names = FALSE)
+}
+
+
+
+# CTD data is pulled down from SCOPE
+if(!file.exists("metadata/falkor_ctd_summary.csv")){
+  # Data source: scope.soest.hawaii.edu/collaborators/datainventory/Data/SCOPEcore/FK_CTDsummary_current.txt
+  falkor_ctd_summary_url <- paste0("http://", scope_uname, ":", scope_pw,
+                "@scope.soest.hawaii.edu/collaborators/datainventory/Data/",
+                "SCOPEcore/FK_CTDsummary_current.txt")
+  falkor_ctd_summary <- read_table(falkor_ctd_summary_url, skip = 2) %>%
+    `colnames<-`(c("station", "cast", "month", "date", "time", "lat", "lat_dir", 
+                   "lon", "lon_dir", "max_depth", "bottles")) %>%
+    mutate(time=strptime(paste(month, date, time), format = "%b %d %Y %X")) %>%
+    select(-month, -date) %>%
+    mutate(lat=mapply(toDecDeg, lat, lat_dir)) %>%
+    mutate(lon=mapply(toDecDeg, lon, lon_dir)) %>%
+    select(-lon_dir, -lat_dir)
+  write.csv(falkor_ctd_summary, file = "metadata/falkor_ctd_summary.csv", row.names = FALSE)
+}
+
+if(!file.exists("metadata/meso_ctd_summary.csv")){
+  # Data url source: scope.soest.hawaii.edu/collaborators/datainventory/Data/SCOPEcore/MS_CTDsummary_current.txt
+  meso_ctd_summary_url <- paste0("http://", scope_uname, ":", scope_pw,
+                                 "@scope.soest.hawaii.edu/collaborators/datainventory/Data",
+                                 "/SCOPEcore/MS_CTDsummary_current.txt")
+  meso_ctd_summary <- read_table(meso_ctd_summary_url, skip = 2) %>%
+    `colnames<-`(c("station", "cast", "month", "date", "time", "lat", "lat_dir", 
+                   "lon", "lon_dir", "max_depth", "bottles")) %>%
+    mutate(station=ifelse(startsWith(station, "L"), station, paste0("MS", station))) %>%
+    mutate(time=strptime(paste(month, date, time), format = "%b %d %Y %X")) %>%
+    select(-month, -date) %>%
+    mutate(lat=mapply(toDecDeg, lat, lat_dir)) %>%
+    mutate(lon=mapply(toDecDeg, lon, lon_dir)) %>%
+    select(-lon_dir, -lat_dir)
+  write.csv(meso_ctd_summary, "metadata/meso_ctd_summary.csv", row.names = FALSE)
+}
+
+
+
+# SLA data is pulled down from CMAP
+if(!file.exists("metadata/falkor_CMAP_SLA.csv")){
+  falkor_cruisename = "SCOPE_Falkor2"
+  falkor_cruise_data <- get_cruise_by_name(falkor_cruisename)
+  falkor_CMAP_SLA <- get_spacetime(tableName = 'tblAltimetry_REP',
+                     varName = 'sla',
+                     dt1=as.character(falkor_cruise_data$Start_Time),
+                     dt2=as.character(falkor_cruise_data$End_Time),
+                     lat1=falkor_cruise_data$Lat_Min,
+                     lat2=falkor_cruise_data$Lat_Max,
+                     lon1=falkor_cruise_data$Lon_Min,
+                     lon2=falkor_cruise_data$Lon_Max)
+  write.csv(falkor_CMAP_SLA, file="metadata/falkor_CMAP_SLA.csv", row.names = FALSE)
+}
+
+if(!file.exists("metadata/meso_SLA.csv")){
+  mesoscope_cruisename = "MESO_SCOPE"
+  mesoscope_CMAP_data <- get_cruise_by_name(mesoscope_cruisename)
+  meso_SLA <- get_spacetime(tableName = 'tblAltimetry_REP',
+                       varName = 'sla',
+                       dt1=as.character(mesoscope_CMAP_data$Start_Time),
+                       dt2=as.character(mesoscope_CMAP_data$End_Time),
+                       lat1=mesoscope_CMAP_data$Lat_Min,
+                       lat2=mesoscope_CMAP_data$Lat_Max,
+                       lon1=mesoscope_CMAP_data$Lon_Min,
+                       lon2=mesoscope_CMAP_data$Lon_Max)
+  write.csv(meso_SLA, "metadata/meso_SLA.csv", row.names = FALSE)
+}
+```
+
+We begin with the Falkor data since it's nice and neat. The key for this is
+190715 since that's when the samples were run.
+
+```{r falkor_metadata}
+# Extract station, triplicate, cast, depth, and spindir from file name ----
+falkor_filename_data <- ms_files %>%
+  str_subset("190715_Smp") %>%
+  basename() %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "(?<=S)\\d+")) %>%
+  mutate(cast=1) %>%
+  mutate(tripl=str_extract(filename, "(?<=_)[A-C](?=.mzML$)")) %>%
+  mutate(depth=str_extract(filename, "DCM|25m")) %>%
+  mutate(spindir=ifelse(station%in%c(62, 64), "cyclonic", "anticyclonic")) %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=strptime(date_run, format = "%y%m%d"))
+
+# Get lat/lon for each station ----
+falkor_ctd_summary <- read.csv("metadata/falkor_ctd_summary.csv") %>%
+  mutate(station=as.character(station)) %>%
+  filter(station%in%unique(falkor_filename_data$station)) %>%
+  select(station, time, lat, lon)
+
+# Get actual SLA from CMAP, averaging within a 0.25 degree grid and daily resolution ----
+falkor_CMAP_SLA <- read.csv("metadata/falkor_CMAP_SLA.csv")
+falkor_SLA_data <- falkor_ctd_summary %>%
+  split(seq_len(nrow(.))) %>%
+  lapply(function(metadata){
+    falkor_CMAP_SLA[falkor_CMAP_SLA$lat>metadata$lat-0.125&falkor_CMAP_SLA$lat<metadata$lat+0.125&
+                 falkor_CMAP_SLA$lon>metadata$lon-0.125&falkor_CMAP_SLA$lon<metadata$lon+0.125&
+                 falkor_CMAP_SLA$time==as.Date(metadata$time),] %>%
+      cbind(station=metadata$station)
+  }) %>% do.call(what = "rbind") %>%
+  select(station, sla)
+
+# Read in DCM data ----
+all_DCMs <- read.csv("metadata/all_DCMs.csv")
+
+# Add time, lat/lon, abs_depth, and sla columns from the smaller tables above ----
+falkor_sample_metadata <- falkor_filename_data %>%
+  left_join(falkor_ctd_summary) %>%
+  left_join(all_DCMs) %>%
+  mutate(abs_depth=as.numeric(
+    ifelse(depth=="DCM", DCM_depth, str_extract(depth, "[0-9]+")))
+    ) %>%
+  left_join(falkor_SLA_data, by="station")
+
+# Do the same thing for sample extras (blank, pooled, standards) ----
+falkor_extra_metadata <- ms_files %>%
+  str_subset("190715") %>%
+  str_subset("Smp", negate = TRUE) %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(cast=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(tripl=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(DCM_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(spindir=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(time=NA) %>%
+  mutate(lon=NA) %>%
+  mutate(lat=NA) %>%
+  mutate(abs_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(sla=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=strptime(date_run, format = "%y%m%d"))
+
+falkor_metadata_complete <- rbind(falkor_sample_metadata, falkor_extra_metadata)
+write.csv(falkor_metadata_complete, file = "metadata/falkor_metadata_complete.csv", row.names = FALSE)
+```
+
+The MESOSCOPE cruise consisted of two portions - the *transect* that sailed across
+an eddy dipole, and the *centers* where two Lagrangian stations were created
+in the center of two dipoles. The transect data has many stations with three
+different depths - 15m, the DCM, and 175 meters. The eddy center data consists of
+high-resolution sampling across the DCM at +/- 20, 10, and 0m.
+
+The transect samples were run on August 21st, 2018 and thereby have a key of
+180821. The eddy centers were run in February of the same year and thereby have
+a key of 180205.
+
+```{r mesotransect_metadata}
+# Extract station, triplicate, cast, depth, and spindir from file name ----
+transect_filename_data <- ms_files %>%
+  str_subset("180821_Smp") %>%
+  basename() %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "MS\\d+")) %>%
+  mutate(cast=as.numeric(str_extract(filename, "(?<=C)\\d"))) %>%
+  mutate(tripl=str_extract(filename, "(?<=_)[A-C]")) %>%
+  mutate(depth=str_extract(filename, "DCM|15m|175m")) %>%
+  mutate(spindir=ifelse(station%in%paste0("MS", c(4, 11:13)), 
+                        "cyclonic", "anticyclonic"))  %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=strptime(date_run, format = "%y%m%d"))
+
+# Get lat/lon for each station from the complete mesoscope metadata ----
+transect_ctd_summary <- read.csv("metadata/meso_ctd_summary.csv") %>%
+  mutate(station=as.character(station)) %>%
+  filter(station%in%unique(transect_filename_data$station)) %>%
+  select(station, cast, time, lat, lon)
+
+# DCM depths for each station ----
+all_DCMs <- read.csv("metadata/all_DCMs.csv")
+
+# Get SLA data from downloaded CMAP file ----
+meso_SLA <- read.csv("metadata/meso_SLA.csv")
+transect_SLA_data <- transect_ctd_summary %>%
+  group_by(station) %>%
+  summarize(lat=min(lat), lon=min(lon), time=min(time)) %>%
+  ungroup() %>%
+  split(seq_len(nrow(.))) %>%
+  lapply(function(metadata){
+    meso_SLA[meso_SLA$lat>metadata$lat-0.125&meso_SLA$lat<metadata$lat+0.125&
+          meso_SLA$lon>metadata$lon-0.125&meso_SLA$lon<metadata$lon+0.125&
+          meso_SLA$time==as.Date(metadata$time),] %>%
+      cbind(station=metadata$station)
+  }) %>% do.call(what = "rbind") %>%
+  select(station, sla)
+
+# Add time, lat/lon, abs_depth, and sla columns from the smaller tables above ----
+transect_sample_metadata <- transect_filename_data %>%
+  left_join(transect_ctd_summary) %>% 
+  left_join(all_DCMs) %>%
+  mutate(abs_depth=as.numeric(
+    ifelse(depth=="DCM", DCM_depth, str_extract(depth, "[0-9]+")))
+    ) %>%
+  left_join(transect_SLA_data, by="station")
+
+# Do the same thing for sample extras (blank, pooled, standards) ----
+transect_extra_metadata <- ms_files %>%
+  str_subset("180821") %>%
+  str_subset("Smp", negate = TRUE) %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(cast=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(tripl=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(spindir=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(DCM_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(time=NA) %>%
+  mutate(lon=NA) %>%
+  mutate(lat=NA) %>%
+  mutate(abs_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(sla=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=strptime(date_run, format = "%y%m%d"))
+
+# Combine and write out ----
+transect_metadata_complete <- rbind(transect_sample_metadata, transect_extra_metadata)
+write.csv(transect_metadata_complete, file = "metadata/transect_metadata_complete.csv", row.names = FALSE)
+```
+
+
+```{r mesocenter_metadata}
+# Extract station, triplicate, cast, depth, and spindir from file name ----
+center_filename_data <- ms_files %>%
+  str_subset("180205_Smp") %>%
+  basename() %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "L\\d")) %>%
+  mutate(cast=as.numeric(str_extract(filename, "(?<=C)\\d+"))) %>%
+  mutate(tripl=str_extract(filename, "(?<=_)[A-C]")) %>%
+  mutate(depth=str_extract(filename, "DCM(plus|less)?(10m|20m)?")) %>%
+  mutate(spindir=ifelse(station=="L1", "cyclonic", "anticyclonic")) %>%
+  mutate(depth_diff=sapply(depth, function(depth){
+    depth_num <- str_extract(depth, "(?<=DCM(plus|less))\\d*")
+    depth_num <- ifelse(is.na(depth_num), 0, depth_num)
+    depth_sign <- sapply(str_extract(depth, "less|plus"), 
+                         switch, "plus"=1, "less"=-1, 0, USE.NAMES = FALSE)
+    as.numeric(depth_num)*depth_sign
+  }))  %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=strptime(date_run, format = "%y%m%d"))
+
+# Get lat/lon for each station from the complete mesoscope metadata ----
+center_ctd_summary <- read.csv("metadata/meso_ctd_summary.csv") %>%
+  mutate(station=as.character(station)) %>%
+  filter(station%in%unique(center_filename_data$station)) %>%
+  select(station, cast, time, lat, lon)
+
+# DCM depths for each station ----
+all_DCMs <- read.csv("metadata/all_DCMs.csv")
+
+# Get SLA data from downloaded CMAP file ----
+meso_SLA <- read.csv("metadata/meso_SLA.csv")
+center_SLA_data <- center_ctd_summary %>%
+  group_by(station) %>%
+  summarize(lat=min(lat), lon=min(lon), time=min(time)) %>%
+  ungroup() %>%
+  split(seq_len(nrow(.))) %>%
+  lapply(function(metadata){
+    meso_SLA[meso_SLA$lat>metadata$lat-0.125&meso_SLA$lat<metadata$lat+0.125&
+          meso_SLA$lon>metadata$lon-0.125&meso_SLA$lon<metadata$lon+0.125&
+          meso_SLA$time==as.Date(metadata$time),] %>%
+      cbind(station=metadata$station)
+  }) %>% do.call(what = "rbind") %>%
+  select(station, sla)
+
+# Add time, lat/lon, abs_depth, and sla columns from the smaller tables above ----
+center_sample_metadata <- center_filename_data %>%
+  left_join(center_ctd_summary) %>%
+  left_join(all_DCMs) %>%
+  mutate(abs_depth=DCM_depth+depth_diff) %>%
+  select(-depth_diff) %>%
+  left_join(center_SLA_data, by="station")
+
+# Do the same thing for sample extras (blank, pooled, standards) ----
+center_extra_metadata <- ms_files %>%
+  str_subset("180205") %>%
+  str_subset("Smp", negate = TRUE) %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(cast=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(tripl=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(spindir=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(DCM_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(time=NA) %>%
+  mutate(lon=NA) %>%
+  mutate(lat=NA) %>%
+  mutate(abs_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(sla=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=strptime(date_run, format = "%y%m%d"))
+
+# Combine and write out ----
+center_metadata_complete <- rbind(center_sample_metadata, center_extra_metadata)
+write.csv(center_metadata_complete, file = "metadata/center_metadata_complete.csv", row.names = FALSE)
+```
+
+Finally, we combine the three data frames with a couple extra blanks and write it
+out into a single big one for use elsewhere.
+
+```{r combine_all}
+# Read in data ----
+center_metadata_complete <- read.csv(file = "metadata/center_metadata_complete.csv")
+transect_metadata_complete <- read.csv(file = "metadata/transect_metadata_complete.csv")
+falkor_metadata_complete <- read.csv(file = "metadata/falkor_metadata_complete.csv")
+
+extra_blanks <- ms_files %>%
+  str_subset("170706") %>%
+  as.data.frame() %>%
+  `names<-`("filename") %>%
+  mutate(station=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(cast=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(tripl=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(DCM_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(spindir=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(date_run=str_extract(filename, "^\\d+")) %>%
+  mutate(date_run=as.character(strptime(date_run, format = "%y%m%d"))) %>%
+  mutate(time=NA) %>%
+  mutate(lat=NA) %>%
+  mutate(lon=NA) %>%
+  mutate(abs_depth=str_extract(filename, "Blk|Std|Poo")) %>%
+  mutate(sla=str_extract(filename, "Blk|Std|Poo"))
+
+
+# Write out data ----
+metadata_complete <- rbind(
+  cbind(falkor_metadata_complete, cruise="falkor"),
+  cbind(center_metadata_complete, cruise="mesocenter"),
+  cbind(transect_metadata_complete, cruise="mesotransect"),
+  cbind(extra_blanks, cruise="mesotransect")
+)
+write.csv(metadata_complete, file = "metadata/metadata_complete.csv", row.names = FALSE)
+```
+
+# Sample key ----
+The sample key is the file produced by the instrument that describes the
+experiment run and the samples injected. It's stored on the QE drive
+at Z:\1_QEdata\LTC\DATA\HILIC\190718_DepthProfiles_FK180310,
+Z:\1_QEdata\LTC\DATA\Projects_2018\HILIC_2018\180821_Wei_MESO-SCOPE_EddyTransect\positive, and
+Z:\1_QEdata\LTC\DATA\Projects_2018\HILIC_2018\180205_Wei_MESO-SCOPE_HRM_DepthProfile\positive,
+but copied over here
+to avoid having to connect to the drive every time.
+
+```{r sampkey}
+if(!file.exists("metadata/combined_sample_key.csv")){
+  if(!dir.exists("Z:\\1_QEdata")){
+    stop("Map yo Z: drive!")
+  }
+  
+  falkor_key <- read.csv(paste0("Z:\\1_QEdata\\LTC\\DATA\\HILIC\\190718_Depth",
+                              "Profiles_FK180310\\Sample.Key.HILIC.csv"),
+                       skip = 1) %>% 
+  mutate(filename=paste0(Sample.Name, ".mzML")) %>% 
+  filter(filename%in%ms_files) %>%
+  select(filename, inj_vol=Inj.vol)
+  transect_key <- paste0("Z:\\1_QEdata\\LTC\\DATA\\Projects_2018\\HILIC_2018\\",
+                         "180821_Wei_MESO-SCOPE_EddyTransect\\positive\\",
+                         "Sample.Key.EddyTransect.HILIC.csv") %>%
+    read.csv() %>% 
+    add_row(Sample.Name="170706_Blk_Blk0p2_1", Bio.Normalization=1) %>%
+    add_row(Sample.Name="170706_Blk_Blk0p2_2", Bio.Normalization=1) %>%
+    mutate(filename=paste0(Sample.Name, ".mzML")) %>% 
+    filter(filename%in%ms_files) %>%
+    select(filename, inj_vol=Bio.Normalization)
+  
+  center_key <- paste0("Z:\\1_QEdata\\LTC\\DATA\\Projects_2018\\HILIC_2018\\",
+                         "180205_Wei_MESO-SCOPE_HRM_DepthProfile\\positive\\",
+                         "Sample.Key.csv") %>%
+    read.csv() %>% 
+    add_row(Sample.Name="180205_Std_4uMStdsInH2O_1", Bio.Normalization=1) %>%
+    add_row(Sample.Name="180205_Std_4uMStdsInH2O_2", Bio.Normalization=1) %>%
+    add_row(Sample.Name="180205_Std_4uMStdsInMatrix_1", Bio.Normalization=1) %>%
+    add_row(Sample.Name="180205_Std_4uMStdsInMatrix_2", Bio.Normalization=1) %>%
+    mutate(filename=paste0(Sample.Name, ".mzML")) %>% 
+    filter(filename%in%ms_files) %>%
+    select(filename, inj_vol=Bio.Normalization)
+  
+  combined_sample_key <- rbind(falkor_key, transect_key, center_key)
+  
+  write.csv(combined_sample_key, file="metadata/combined_sample_key.csv")
+}
+```
+
+
+
+# Standards metadata ----
+It's also nice to pull down a list of standards that will be found in the data.
+
+```{r grabstans}
+if(!file.exists("metadata/raw_stans.csv")){
+  
+  raw_stans <- read.csv(paste0("https://raw.githubusercontent.com/",
+                               "IngallsLabUW/Ingalls_Standards/master/",
+                               "Ingalls_Lab_Standards_NEW.csv"))
+  write.csv(raw_stans, file = "metadata/raw_stans.csv")
+}
+raw_stans <- read.csv("metadata/raw_stans.csv")
+clean_stans <- raw_stans %>%
+  filter(Column=="HILIC") %>%
+  mutate(polarity=ifelse(str_detect(z, "-"), "neg", "pos")) %>%
+  mutate(m.z=as.numeric(m.z)) %>%
+  select(compound_type=Compound.Type, compound_name=Compound.Name,
+         compound_name_old=Compound.Name_old,
+         formula=Emperical.Formula, rt=RT..min., mz=m.z, ionization_form,
+         charge=z, kegg_id=C0, polarity, date_added=Date.added, mix=HILICMix) %>%
+  add_row(compound_type="Custom",
+          compound_name="Sulfobetaine", compound_name_old="Sulfobetaine",
+          formula="C4H8O2S", rt=6.9, mz=120.024501+1.007276,
+          ionization_form="[M+H]", charge=1, kegg_id=NA) %>%
+  mutate(date_added=strptime(x = date_added, format = "%y%m%d")) %>%
+  filter(date_added<=strptime(x = "190715", format = "%y%m%d"))
+write.csv(clean_stans, file = "metadata/clean_stans.csv", row.names = FALSE)
+```
+
+
+# POC and nutrient data ----
+
+```{r falkor_pcnut_download}
+if(!file.exists("metadata/falkor_pcn_data.csv")){
+  # Data source: http://scope.soest.hawaii.edu/collaborators/datainventory/Data/Karl/Karl_FK_Nutrients_Final.xlsx
+  falkor_CN_url <- paste0("http://", scope_uname, ":", scope_pw,
+                "@scope.soest.hawaii.edu/collaborators/datainventory/Data/Karl/Karl_FK_PCPN_WC_current.xlsx")
+  temp_file <- tempfile(fileext = ".xlsx")
+  download.file(falkor_CN_url, destfile = temp_file, mode = "wb")
+  clean_pcn <- readxl::read_excel(temp_file, skip=1) %>%
+    slice(-1:-2) %>%
+    filter(is.na(Comments)) %>%
+    select(sample="Name", depth=`Depth (m)`, PC_um=`C value (µmol/L)`, PN_um=`N value (µmol/L)`) %>%
+    mutate(station=as.numeric(str_extract(sample, "(?<=FK-)\\d+")))
+  unlink(temp_file)
+  write.csv(clean_pcn, "metadata/falkor_pcn_data.csv", row.names = FALSE)
+}
+if(!file.exists("metadata/falkor_nutrient_data.csv")){
+  # Data source: http://scope.soest.hawaii.edu/collaborators/datainventory/Data/Karl/Karl_FK_Nutrients_Final.xlsx
+  falkor_nutrient_url <- paste0("http://", scope_uname, ":", scope_pw,
+                "@scope.soest.hawaii.edu/collaborators/datainventory/Data/",
+                "Karl/Karl_FK_Nutrients_Final.xlsx")
+  temp_file <- tempfile(fileext = ".xlsx")
+  download.file(falkor_nutrient_url, destfile = temp_file, mode = "wb")
+  clean_nuts <- readxl::read_excel(temp_file, skip = 3) %>%
+    select(depth=`Depth`, sample=`Sample ID`, po4_um=`µM PO4`, no23_um=`µM N+N`) %>%
+    filter(!is.na(depth)) %>%
+    filter(!depth=="Depth") %>%
+    mutate(sample=ifelse(startsWith(sample, "FK"), sample, NA)) %>%
+    fill(sample) %>%
+    mutate(station=str_extract(sample, "(?<=FK 180310[- ])\\d+")) %>%
+    mutate(across(c(depth, po4_um, no23_um, station), as.numeric))
+  unlink(temp_file)
+  write.csv(clean_nuts, "metadata/falkor_nutrient_data.csv", row.names = FALSE)
+}
+```
+
+The Karl lab has provided PC, PN, and nutrient (N*, PO4) data for some stations:
+
+```{r falkor_pcnut_station_comparison}
+falkor_ctd_summary <- read.csv("metadata/falkor_ctd_summary.csv")
+falkor_nutrient_data <- read.csv("metadata/falkor_nutrient_data.csv")
+falkor_pcn_data <- read.csv("metadata/falkor_pcn_data.csv")
+falkor_metadata_complete <- read.csv("metadata/falkor_metadata_complete.csv")
+
+# PC/PN stations
+falkor_pcn_data %>% 
+  left_join(falkor_ctd_summary) %>%
+  distinct(station, time)
+# Nutrient (NO3, PO4) stations
+falkor_nutrient_data %>% 
+  left_join(falkor_ctd_summary) %>%
+  distinct(station, time)
+# Metabolite stations
+falkor_metadata_complete %>%
+  distinct(station, time) %>%
+  filter(!is.na(time))
+```
+
+Looks like we never get a perfect match from our stations to those also analyzed by the Karl lab, but perhaps some of the numbers are close enough. Station 74, for example, might need to be assumed to be representative of the anticyclone eddy as a whole because Station 73 was done during the transect between the two eddies. Similarly, Station 59 is probably the one we should use for the cyclonic eddy because it was taken around the same time.
+
+This assumption is safe if we assume that 1) the gyre doesn't undergo that much diel variability, at least on the scale of nutrients and PC/PN and 2) that most days look the same. Station 74 was a 1am cast, 12hrs before station 77 (4pm) and 24hrs before station 80 (4am, next day). Station 59 was the same setup - a 1am cast 12hrs before station 62 and 24 before station 64.
+
+We can check this assumption for nutrients and particulate stuff by plotting the depth profiles with each other:
+
+```{r check_falkor_pcnut}
+falkor_nutrient_data %>%
+  left_join(falkor_ctd_summary) %>%
+  mutate(day_hour=as.numeric(format(as.POSIXct(time), "%H"))) %>%
+  mutate(time_block=ifelse(day_hour<6|day_hour>18, "night", "day")) %>%
+  pivot_longer(cols = c(po4_um, no23_um)) %>%
+  ggplot() +
+  geom_path(aes(x=value, y=-depth, group=station, color=time_block)) +
+  facet_wrap(~name, scales = "free_x", nrow = 1)
+
+falkor_pcn_data %>%
+  left_join(falkor_ctd_summary) %>%
+  mutate(day_hour=as.numeric(format(as.POSIXct(time), "%H"))) %>%
+  mutate(time_block=ifelse(day_hour<6|day_hour>18, "night", "day")) %>%
+  pivot_longer(cols = c(PC_um, PN_um)) %>%
+  ggplot() +
+  geom_path(aes(x=value, y=-depth, group=station, color=time_block)) +
+  facet_wrap(~name, scales = "free_x", nrow = 1)
+```
+
+Unfortunately, this isn't a perfect test because the only "day" station is 73, which was collected in between the two eddies. However, it does look like it's within the normal range of values so I'm kinda okay with this?
+
+If so, then we can add PC, PN, and nutrients to our metadata by mapping station 59 to stations 62 and 64, and station 74 to stations 77 and 80. Basically we'll have PC, PN, N*, and P measurements wrt depth and cyclone, but not time.
+
+```{r add_pcnut_to_complete}
+falkor_metadata_complete <- read.csv(file = "metadata/falkor_metadata_complete.csv")
+
+pcnut_falkor <- falkor_metadata_complete %>% 
+  filter(!is.na(time)) %>%
+  distinct(station, abs_depth) %>%
+  mutate(ref_station=ifelse(station%in%c(62, 64), 59, 74)) %>%
+  mutate(PC_um=mapply(function(var_depth, ref_station){
+    falkor_pcn_data %>%
+      filter(station==ref_station) %>%
+      pull(PC_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, ref_station)) %>%
+  mutate(PN_um=mapply(function(var_depth, ref_station){
+    falkor_pcn_data %>%
+      filter(station==ref_station) %>%
+      pull(PN_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, ref_station)) %>%
+  mutate(no23_um=mapply(function(var_depth, ref_station){
+    falkor_nutrient_data %>%
+      filter(station==ref_station) %>%
+      pull(no23_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, ref_station)) %>%
+  mutate(po4_um=mapply(function(var_depth, ref_station){
+    falkor_nutrient_data %>%
+      filter(station==ref_station) %>%
+      pull(po4_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, ref_station)) %>%
+  select(-ref_station)
+
+write.csv(pcnut_falkor, file = "metadata/falkor_nutrients_pcpn.csv", row.names = FALSE)
+```
+
+Aaaaaaand repeat for mesocenter and mesotransect.
+
+```{r meso_nutpc_download}
+# Can't find PC/PN data for the eddy centers on SCOPE website
+
+if(!file.exists("metadata/transect_pcn_data.csv")){
+  # Data source: http://scope.soest.hawaii.edu/collaborators/datainventory/Data/SCOPEcore/2017MS_CoreData_current.xls
+  transect_pcpn_url <- paste0("http://", scope_uname, ":", scope_pw,
+                "@scope.soest.hawaii.edu/collaborators/datainventory/Data/",
+                "SCOPEcore/2017MS_CoreData_current.xls")
+  
+  temp_file <- tempfile(fileext = ".xls")
+  download.file(transect_pcpn_url, destfile = temp_file, mode = "wb")
+  clean_pcn <- readxl::read_excel(temp_file, skip = 1, sheet = "PCPN") %>%
+    slice(-1) %>%
+    select(depth=depth_sample, station, PC_um=particulate_carbon, 
+           PN_um=particulate_nitrogen, cast=cast_num) %>%
+    mutate(across(everything(), as.numeric)) %>%
+    filter(station < 16) %>%
+    mutate(station=paste0("MS", station))
+  unlink(temp_file)
+  write.csv(clean_pcn, "metadata/transect_pcn_data.csv", row.names = FALSE)
+}
+
+if(!file.exists("metadata/meso_nutrient_data.csv")){
+  # Data source: http://scope.soest.hawaii.edu/collaborators/datainventory/Data/Karl/Karl_MS_Nutrient_Summary_KB.xlsx
+  transect_nutrient_url <- paste0("http://", scope_uname, ":", scope_pw,
+                "@scope.soest.hawaii.edu/collaborators/datainventory/Data/Karl/",
+                "Karl_MS_Nutrient_Summary_KB.xlsx")
+  temp_file <- tempfile(fileext = ".xlsx")
+  download.file(transect_nutrient_url, destfile = temp_file, mode = "wb")
+  clean_nuts <- readxl::read_excel(temp_file, skip = 3, sheet = "KM1709 Transect, L1,L2 profiles") %>%
+    slice(-1:-2) %>%
+    select(depth=Depth, station=Station, cast=Cast, po4_um=`Si`, no23_um=`N+N`) %>%
+    mutate(across(c(depth, cast, po4_um, no23_um), as.numeric)) %>%
+    mutate(station=ifelse(startsWith(station, "L"), station, paste0("MS", station)))
+  unlink(temp_file)
+  
+  write.csv(clean_nuts, "metadata/meso_nutrient_data.csv", row.names = FALSE)
+}
+```
+
+```{r review_meso_pcnuts}
+transect_metadata_complete <- read.csv("metadata/transect_metadata_complete.csv")
+meso_ctd_summary <- read.csv("metadata/meso_ctd_summary.csv")
+meso_nutrient_data <- read.csv("metadata/meso_nutrient_data.csv")
+transect_pcn_data <- read.csv("metadata/transect_pcn_data.csv")
+center_metadata_complete <- read.csv("metadata/center_metadata_complete.csv")
+
+transect_pcn_data %>%
+  pivot_longer(c(PC_um, PN_um)) %>%
+  ggplot() +
+  geom_path(aes(x=value, y=-depth, group=station)) +
+  facet_wrap(~name, nrow = 1, scales = "free_x")
+
+meso_nutrient_data %>%
+  pivot_longer(cols = c(po4_um, no23_um)) %>%
+  ggplot() + 
+  geom_path(aes(x=value, y=-depth, group=station)) +
+  facet_wrap(~name, nrow = 1, scales = "free_x")
+
+# PC/PN stations (transect only)
+transect_pcn_data %>% 
+  left_join(meso_ctd_summary) %>%
+  distinct(station, cast)
+# Nutrient (NO3, PO4) stations (transect and centers)
+meso_nutrient_data %>% 
+  left_join(meso_ctd_summary) %>%
+  distinct(station, cast)
+# Metabolite stations (transect and centers)
+transect_metadata_complete %>%
+  rbind(center_metadata_complete) %>%
+  distinct(station, cast)
+```
+
+```{r combine_meso_pcnuts}
+pcnut_transect <- transect_metadata_complete %>% 
+  filter(!is.na(time)) %>%
+  distinct(station, abs_depth) %>%
+  mutate(PC_um=mapply(function(var_depth, ref_station){
+    transect_pcn_data %>%
+      filter(station==ref_station) %>%
+      pull(PC_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, station)) %>%
+  mutate(PN_um=mapply(function(var_depth, ref_station){
+    transect_pcn_data %>%
+      filter(station==ref_station) %>%
+      pull(PN_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, station)) %>%
+  mutate(no23_um=mapply(function(var_depth, ref_station){
+    meso_nutrient_data %>%
+      filter(station==ref_station) %>%
+      pull(no23_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, station)) %>%
+  mutate(po4_um=mapply(function(var_depth, ref_station){
+    meso_nutrient_data %>%
+      filter(station==ref_station) %>%
+      group_by(depth) %>%
+      summarize(station=unique(station),
+                po4_um=mean(po4_um, na.rm=TRUE), .groups = "drop") %>%
+      filter(!is.na(po4_um)) %>%
+      pull(po4_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, station))
+
+write.csv(pcnut_transect, file = "metadata/transect_nutrients_pcpn.csv", row.names = FALSE)
+
+
+
+# Nutrient data was only collected on 
+# L1: cast 6, while my samples were collected on casts 32 and 33
+# L2: casts 8 and 26, while my samples were collected on casts 1 and 2
+pcnut_center <- center_metadata_complete %>% 
+  filter(!is.na(time)) %>%
+  distinct(station, abs_depth) %>%
+  mutate(no23_um=mapply(function(var_depth, ref_station){
+    meso_nutrient_data %>%
+      filter(station==ref_station) %>%
+      group_by(depth) %>%
+      summarize(station=unique(station),
+                no23_um=mean(no23_um, na.rm=TRUE), .groups = "drop") %>%
+      pull(no23_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, station)) %>%
+  mutate(po4_um=mapply(function(var_depth, ref_station){
+    meso_nutrient_data %>%
+      filter(station==ref_station) %>%
+      group_by(depth) %>%
+      summarize(station=unique(station),
+                po4_um=mean(po4_um, na.rm=TRUE), .groups = "drop") %>%
+      filter(!is.na(po4_um)) %>%
+      pull(po4_um, depth) %>%
+      approx(x = as.numeric(names(.)), y=., xout=var_depth) %>%
+      `$`("y")
+  }, abs_depth, station)) %>%
+  mutate(PN_um=NA) %>%
+  mutate(PC_um=NA)
+
+write.csv(pcnut_center, file = "metadata/center_nutrients_pcpn.csv", row.names = FALSE)
+```
+
+```{r append_pcnuts_metadata_complete}
+falkor_nutrients_pcpn <- read.csv(file = "metadata/falkor_nutrients_pcpn.csv")
+transect_nutrients_pcpn <- read.csv(file = "metadata/transect_nutrients_pcpn.csv")
+center_nutrients_pcpn <- read.csv(file = "metadata/center_nutrients_pcpn.csv")
+
+metadata_complete <- read.csv("metadata/metadata_complete.csv") %>%
+  mutate(abs_depth=as.numeric(abs_depth))
+
+combined_pcnut <- rbind(falkor_nutrients_pcpn, transect_nutrients_pcpn, center_nutrients_pcpn)
+
+metadata_complete <- left_join(metadata_complete, combined_pcnut)
+write.csv(metadata_complete, file = "metadata/metadata_complete.csv", row.names = FALSE)
+```
+
