@@ -1,0 +1,204 @@
+---
+title: "XCMS_master"
+author: "Katherine Heal, edited by RML 02/6/20"
+date: "November 9, 2016"
+output: html_document
+---
+This code is just the XCMS and CAMERA functions.  It should only be run on a high powered computer.
+
+#Load Libraries and source code
+```{r Libraries, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(plyr) 
+library(ggplot2) 
+library(gridExtra) 
+library(dplyr) 
+#library(seqinr) 
+library(lubridate)
+library(reshape2)
+library(tidyr)
+library(Hmisc)
+library(gtools)
+library(cowplot)
+require(RColorBrewer)
+library(readr)
+library(plotly)
+library(stringr)
+library(xcms) 
+library(IPO)
+
+```
+
+#Setup Experiment
+This experiment was processed through XCMS on 3/2/17 on personal computer
+```{r Set experiment and fraction name.  Raw data file -> "rawdat" -> Fraction (i.e. "CyanoDCM") -> Experiment ("Eddy_samples"), results='hide', message=FALSE, warning=FALSE}
+
+Experiment <- "Gradients2016"
+Location <- "/Users/katherine2/Google_Drive/00_XCMS_Working/"
+FractionList <- c("HILICNeg", "HILICPos", "CyanoAq", "CyanoDCM")
+
+ExpDIR <-paste(Location, Experiment, sep = "", collapse = NULL)
+```
+
+If you have not set up your results directories yet, run this.  Once you have your xcms run, you don't need to rerun this.  As long as the final line is commented out though, its okay.
+```{r Set your Directories, grab Params and ISList, results='hide', message=FALSE, warning=FALSE}
+FractionDIR <- c()
+ResultsDIR <- c()
+DataDIR <- c()
+
+for (j in 1:length(FractionList)) {
+  FractionDIR[j] <- paste(ExpDIR, "/", FractionList[j], sep = "", collapse = NULL)
+  ResultsDIR[j] <- paste(FractionDIR[j], "/Results", Sys.Date(), sep = "", collapse = NULL)
+ #dir.create(file.path(ResultsDIR[j]), showWarnings = FALSE) #Comment out if you don't need to make the folder i.e. you've already run XCMS and need to redo the next steps
+  DataDIR <-  paste(FractionDIR, "/rawdat", sep = "", collapse = NULL)
+}
+Dirs <- data.frame(FractionList, FractionDIR, ResultsDIR, DataDIR)
+
+#Modify this to get to your results of choice
+ Dirs <- Dirs %>% mutate(ResultsDIR = ResultsDIR %>%
+                         str_replace("Results2017-05-11",
+                                     "Results2017-05-09")) 
+ rownames(Dirs) <- Dirs$FractionList
+#write.csv(Dirs, paste(ExpDIR, "/Dirs.csv", sep="", collapse =NULL))#Write this csv when you are satisfied with it - and then comment it out so you don't accidently rewrite your Dirs CSV.
+```
+
+Run this if you have already made your directories (to access older results)
+```{r, results='hide', message=FALSE, warning=FALSE}
+#Get your directories with preferred results
+Dirs <- read.csv(paste(ExpDIR, "/Dirs.csv", sep="", collapse =NULL), row.names=1) #If this doesn't work, make sure last line of chunk B4 isn't commented out
+
+#Get your functions
+source(paste(Location, "XCMS_funs.R", sep= "", collapse = NULL))
+  
+#Get your parameters
+Params <- read.csv(paste(Location, "Params.csv", sep= "", collapse = NULL), row.names=1)
+Params <- Params[ , 1:4]
+
+```
+
+#Do XCMS, get peak Lists, Print out TICs 
+Running with PEAKGROUPS on all fractions on 5/10/2017
+```{r perform xcms on all fractions, results='hide', message=FALSE, warning=FALSE}
+#for (j in 1:length(FractionList)){
+j=4
+Fraction <- FractionList[j]
+DataDIR <- as.character(Dirs[Fraction, "DataDIR"])
+DatFiles <- list.files(DataDIR, recursive = TRUE, full.names = TRUE)
+DatFiles <- DatFiles[grepl(".mzXML", DatFiles)]
+
+#Save your parameters used for your xcms-ing
+write.csv(Params[,1:4], paste(Dirs[Fraction, "ResultsDIR"], sep = "","/Params_used.csv", collapse = NULL), row.names = TRUE)
+
+#Do the XCMS
+setwd(DataDIR)
+xset1 <- doPeakPick(DatFiles)
+xset1 <- dogrouping(c(xset1))
+
+setwd(as.character(Dirs[Fraction, "ResultsDIR"]))
+save(xset1,  file="xset1_initial.RData")
+
+#Do RT Correction (of some iterations)
+for (k in 1:Params["RTITs", Fraction]){
+xset1 <- doRetcorPG(xset1) #Change to doRetcor for obiwarp, doRetcorPG for peak groups (better for cyano)
+xset1 <- dogrouping(xset1)
+}
+save(xset1,  file="xset2_RTCorrected.RData")
+
+#RT Correction plot
+png("RTCorrplot.png", width = 4, height = 5, units = "in", res = 300) 
+plotrt(xset1, leg = F, densplit = T)
+dev.off() 
+
+#Write unfilled dataframe
+Peaks.unfilled <- peakTable(xset1) 
+Peaks.unfilled$MassFeature <- paste("I", round((Peaks.unfilled$mz),digits=4), "R", round( Peaks.unfilled$rt/60, digits=2), sep="")
+Peaks.unfilled$groupname <- groupnames(xset1)
+Peaks.unfilled$RT <- Peaks.unfilled$rt/60
+Peaks.unfilled$Fraction <- Fraction
+write.csv(Peaks.unfilled, "xset.unfilled.csv")
+
+#Fill in peaks, write dataframe
+xset3 <-  fillPeaks(xset1)
+save(xset3,  file = "xset3_RTCorrected_PeaksFilled.RData")
+
+Peaks.filled <- peakTable(xset3)
+Peaks.filled$MassFeature <- paste("I", round((Peaks.filled$mz),digits=4), "R", round( Peaks.filled$rt/60, digits=2), sep="")
+Peaks.filled$groupname <- groupnames(xset3)
+Peaks.filled$RT <- Peaks.filled$rt/60
+Peaks.filled$Fraction <- Fraction
+
+write.csv(Peaks.filled, "xset.allpeaks.csv")
+getTICs(xcmsSet=xset3, pdfname="TICs.pdf",rt="corrected")
+
+PPS <- as.data.frame(calcPPS(xset3))
+write.csv(PPS, "PPS_results.csv")
+
+#}
+```
+
+#Run Camera_Function and run the camera post processing ---- 
+Needs Camera_Fuction.R , CAMERApostprocessing.fuction.R, XCMS results
+This was run on on peak group retention time correlated data on 5/10/17
+```{r Calculate adducts and isotopes for mass features and calculate neutral mass for ions with two or more adducts, results='hide', message=FALSE, warning=FALSE'}
+source(paste(Location, "Camera_Function.R", sep=""))
+source(paste(Location, "CAMERApostprocessing.function.R", sep=""))
+#for (j in 1:length(FractionList)){
+  j=4
+  Fraction <- FractionList[j]
+  load(paste(as.character(Dirs[Fraction, "ResultsDIR"]), "/xset3_RTCorrected_PeaksFilled.RData", sep=""))
+  
+  if (Fraction == "HILICNeg") {Pol = "negative"} else {Pol = "positive"} 
+  CAMERAlist <- camera (xset3, Polarity = Pol, PPM = 5) 
+  save(CAMERAlist, file = paste(as.character(Dirs[Fraction, "ResultsDIR"]), "/CAMERAlist.RData", sep=""))
+  
+  xset.annot <- CAMERAlist[[1]] 
+  xsaFA <- CAMERAlist[[2]] 
+  IonList <- camerapostprocess(xsaFA, xset.annot) 
+  save(IonList, file = paste(as.character(Dirs[Fraction, "ResultsDIR"]), "/IonList.RData", sep=""))
+  OtherIons <- IonList[[3]] 
+
+#}
+```
+
+
+#Do Very basic Filtering on Data
+Needs XCMS only
+ReRun on 5/31/17, make filter more stark
+```{r Making Averages and basic filtering}
+for (j in 1:4){
+ 
+Fraction <- FractionList[j]
+  setwd(as.character(Dirs[Fraction, "ResultsDIR"]))
+  Peaks.filled <- read.csv("xset.allpeaks.csv")
+  
+  #Get data file names
+  DatNames <- colnames(Peaks.filled)[grepl("X17", colnames(Peaks.filled))]
+  
+  #Specifiy which runs are Blks, samples, and treatments
+  Blks <- DatNames[grepl("_Blk_", DatNames)]
+  Samps <- DatNames[grepl("_Smp_", DatNames)]
+  Poos <- DatNames[grepl("_Poo_", DatNames)]
+
+  
+  
+   #Set rt max and min
+  rtminparam <- Params["RTMIN", Fraction]
+  rtmaxparam <- Params["RTMAX", Fraction]
+  
+ if (length(Blks) > 1) {Peaks.filled$AveBlank<- rowMeans(Peaks.filled[, Blks])} else {Peaks.filled$AveBlank<- Blks[1]}
+  Peaks.filled$AveSmp<- rowMeans(Peaks.filled[, Samps])
+  Peaks.filled$AvePoo <- rowMeans(Peaks.filled[, Poos])
+  Peaks.filtered <- Peaks.filled %>%
+    filter(rt > rtminparam) %>%
+    filter(rt < rtmaxparam) %>%
+     filter(AvePoo > 10*AveBlank)  %>%
+    filter(npeaks > (0.25*length(Samps))) %>%
+    filter(AvePoo > 5000)
+    
+  setwd(as.character(Dirs[Fraction, "ResultsDIR"]))
+  write.csv(Peaks.filtered, "xset.filtered.csv")
+}
+```
+
+#Now do BMIS on each fraction separately
+
